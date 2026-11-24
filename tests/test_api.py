@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 
 import pytest
 from fastapi.testclient import TestClient
@@ -20,6 +21,22 @@ def client(tmp_path, monkeypatch):
     importlib.reload(main)
     with TestClient(main.app) as c:
         yield c, main
+
+
+@pytest.fixture()
+def client_on_copy(tmp_path, monkeypatch):
+    # 检查点副本放在临时目录：便于原子替换与损坏原路径
+    src = os.path.join("checkpoints", "model.pt")
+    work = tmp_path / "work.pt"
+    shutil.copy(src, work)
+    monkeypatch.setenv("CHECKPOINT_PATH", str(work))
+    monkeypatch.setenv("TORCH_NUM_THREADS", "1")
+    import importlib
+
+    import app.main as main
+    importlib.reload(main)
+    with TestClient(main.app) as c:
+        yield c, main, str(work)
 
 
 OLD_ROWS = [
@@ -135,3 +152,80 @@ def test_train_count_mismatch(client):
         json={"instances": OLD_ROWS, "labels": [0]},
     )
     assert resp.status_code == 422
+
+
+# ---- 延迟物化与文件替换语义 ----------------------------------------
+
+
+def test_predict_and_model_info_do_not_materialize_optimizer(client_on_copy):
+    """只做预测/查模型信息：不读取动量张量；首次训练才物化。"""
+    c, main, _ = client_on_copy
+    assert main.service.bundle.optimizer_loaded is False
+
+    assert c.get("/model").json()["optimizer_step"] == 200
+    assert c.post("/predict", json={"instances": OLD_ROWS}).status_code == 200
+    assert main.service.bundle.optimizer_loaded is False
+
+    resp = c.post("/train", json={"instances": OLD_ROWS, "labels": [0, 1]})
+    assert resp.status_code == 200
+    assert main.service.bundle.optimizer_loaded is True
+
+
+def test_atomic_replace_then_train_uses_load_time_snapshot(client_on_copy, tmp_path):
+    """原路径被原子替换后，首次续训的动量仍来自加载时的那份文件。"""
+    c, main, work = client_on_copy
+
+    # 制备另一份检查点 B：多训 3 步（step=203），另存到临时路径
+    from app.checkpoint import load_checkpoint, save_checkpoint_atomic
+    from app.service import ModelService
+
+    other = load_checkpoint(os.path.join("checkpoints", "model.pt"))
+    svc_other = ModelService(other)
+    for _ in range(3):
+        svc_other.train_step(OLD_ROWS, [0, 1])
+    b_path = tmp_path / "model_b.pt"
+    save_checkpoint_atomic(other, str(b_path))
+
+    # 替换前：step=200，记录预测结果
+    assert c.get("/model").json()["optimizer_step"] == 200
+    before = c.post("/predict", json={"instances": OLD_ROWS}).json()
+
+    # 原子替换原路径上的检查点（模拟外部发布新模型）
+    os.replace(b_path, work)
+
+    # 内存模型不受替换影响：预测一致，步数仍是加载时的 200
+    assert c.get("/model").json()["optimizer_step"] == 200
+    assert c.post("/predict", json={"instances": OLD_ROWS}).json() == before
+
+    # 首次续训：动量取自加载时钉住的文件 -> step 200+1=201，
+    # 而不是替换后文件的 203+1
+    resp = c.post("/train", json={"instances": OLD_ROWS, "labels": [0, 1]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["step"] == 201
+
+    # 显式 /reload 后才切换到替换后的文件（step=203）
+    resp = c.post("/reload")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["optimizer_step"] == 203
+    resp = c.post("/train", json={"instances": OLD_ROWS, "labels": [0, 1]})
+    assert resp.json()["step"] == 204
+
+
+def test_failed_reload_keeps_predict_and_train(client_on_copy, tmp_path):
+    """重载失败后，原模型仍可预测和续训。"""
+    c, main, work = client_on_copy
+    bad = tmp_path / "corrupt.pt"
+    bad.write_bytes(b"definitely not a checkpoint")
+
+    resp = c.post("/reload", params={"path": str(bad)})
+    assert resp.status_code == 500
+
+    # 原模型仍可预测
+    assert c.post("/predict", json={"instances": OLD_ROWS}).status_code == 200
+    # 原模型仍可续训：step 200 -> 201
+    resp = c.post("/train", json={"instances": OLD_ROWS, "labels": [0, 1]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["step"] == 201
+    # 原路径仍可重载
+    assert c.post("/reload").status_code == 200
+    assert c.get("/model").json()["optimizer_step"] == 200

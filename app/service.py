@@ -4,6 +4,11 @@
 通过同一把异步锁串行化；预测为只读操作，不与锁互斥
 （PyTorch 张量读取与训练更新在 GIL 下对本作业足够安全，
 且扩列/保存会整体替换 bundle 引用）。
+
+启动与重载采用延迟物化（defer_optimizer）：只读权重、列名与
+Adam 步数；动量张量首次训练/扩列/保存时才从检查点文件的 mmap
+读入并转换精度。重载先完整构建新 bundle 再整体替换，重载失败
+时原模型仍可预测和续训。
 """
 from __future__ import annotations
 
@@ -43,7 +48,8 @@ class ModelService:
             "hidden_dim": b.hidden_dim,
             "num_classes": b.num_classes,
             "dtype": str(b.dtype).replace("torch.", ""),
-            "optimizer_step": _read_step(b.optimizer),
+            # 加载时已读到的步数，不触发动量物化
+            "optimizer_step": b.optimizer_step,
             "source_path": b.source_path,
         }
 
@@ -81,17 +87,18 @@ class ModelService:
         with torch.no_grad():
             loss_before = float(criterion(b.model(x), y))
 
-        b.optimizer.zero_grad()
+        optimizer = b.ensure_optimizer()  # 首次训练时物化动量
+        optimizer.zero_grad()
         logits = b.model(x)
         loss = criterion(logits, y)
         loss.backward()
-        b.optimizer.step()
+        optimizer.step()
 
         with torch.no_grad():
             loss_after = float(criterion(b.model(x), y))
 
         return {
-            "step": _read_step(b.optimizer),
+            "step": b.optimizer_step,
             "loss_before": loss_before,
             "loss_after": loss_after,
             "num_samples": len(instances),
@@ -120,22 +127,12 @@ class ModelService:
     # ---- 从磁盘重载（重启/回退用） --------------------------------
     def reload(self, path: str | None = None) -> dict:
         target = os.path.abspath(path) if path else self._bundle.source_path
-        b = load_checkpoint(target, dtype=self._bundle.dtype)
+        # 先完整构建新 bundle，成功后再整体替换：失败时原模型不受影响
+        b = load_checkpoint(target, dtype=self._bundle.dtype, defer_optimizer=True)
         self._bundle = b
         return {
             "path": b.source_path,
             "feature_names": list(b.feature_names),
             "input_dim": len(b.feature_names),
-            "optimizer_step": _read_step(b.optimizer),
+            "optimizer_step": b.optimizer_step,
         }
-
-
-def _read_step(optimizer: torch.optim.Optimizer) -> int:
-    """兼容不同 PyTorch 版本读取 Adam 的 step。"""
-    state = optimizer.state
-    if not state:
-        return 0
-    step = next(iter(state.values())).get("step", 0)
-    if torch.is_tensor(step):
-        return int(step.item())
-    return int(step)

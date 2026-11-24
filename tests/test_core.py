@@ -7,12 +7,16 @@
 3. 新列零权重、新列读数可更新新增权重；
 4. 缺新列补 0、按列名对齐、多余列忽略；
 5. 保存失败不影响原检查点，成功后重载可按旧字段预测、按新列续训；
-6. 检查点往返后 Adam step 等状态保留。
+6. 检查点往返后 Adam step 等状态保留；
+7. 延迟物化（defer_optimizer）：启动只读权重/列名/步数，动量首次
+   使用时才读入；原子替换后动量仍来自加载时的那份文件；重载失败
+   后原模型仍可预测和续训；与原加载方式逐位一致。
 """
 from __future__ import annotations
 
 import copy
 import os
+import shutil
 
 import pytest
 import torch
@@ -232,3 +236,168 @@ def test_repeated_expand_multiple_columns(bundle):
 def test_duplicate_column_rejected(bundle):
     with pytest.raises(ValueError):
         expand_bundle(bundle, [OLD_FEATURES[0]])
+
+
+# ---- 延迟物化（defer_optimizer） ----------------------------------
+
+
+def _assert_same_params_and_adam(b1, b2, tol=TOL):
+    """两个同形状 bundle 的权重与 Adam 状态逐位对照。"""
+    for (n1, p1), (n2, p2) in zip(
+        b1.model.named_parameters(), b2.model.named_parameters()
+    ):
+        assert n1 == n2
+        err = (p1.detach() - p2.detach()).abs().max().item()
+        assert err <= tol, f"参数 {n1} 最大绝对误差 {err}"
+    params1 = list(b1.model.parameters())
+    params2 = list(b2.model.parameters())
+    state1, state2 = b1.optimizer.state, b2.optimizer.state
+    for p1, p2 in zip(params1, params2):
+        s1, s2 = state1[p1], state2[p2]
+        assert set(s1.keys()) == set(s2.keys())
+        for key in s1:
+            v1, v2 = s1[key], s2[key]
+            if torch.is_tensor(v1):
+                err = (v1 - v2).abs().max().item()
+                assert err <= tol, f"Adam 状态 {n1}.{key} 最大绝对误差 {err}"
+            else:
+                assert v1 == v2
+
+
+def test_lazy_load_defers_optimizer_until_train(old_rows):
+    """延迟物化：启动只读权重/列名/步数，首次训练才读动量。"""
+    src = os.path.join("checkpoints", "model.pt")
+    b = load_checkpoint(src, defer_optimizer=True)
+    assert not b.optimizer_loaded
+    assert b.optimizer_step == 200  # 步数加载时即可读，不触发物化
+
+    svc = ModelService(b)
+    preds = svc.predict(old_rows)  # 预测不需要动量
+    assert len(preds) == len(old_rows)
+    assert not b.optimizer_loaded
+
+    labels = [i % b.num_classes for i in range(len(old_rows))]
+    out = svc.train_step(old_rows, labels)  # 首次训练才物化
+    assert b.optimizer_loaded
+    assert out["step"] == 201
+    assert b.optimizer_step == 201
+
+
+def test_lazy_first_train_matches_eager(old_rows):
+    """同一运行精度与输入：懒加载首次续训与原加载方式逐位一致。"""
+    src = os.path.join("checkpoints", "model.pt")
+    labels = [i % 3 for i in range(len(old_rows))]
+
+    eager = load_checkpoint(src)
+    lazy = load_checkpoint(src, defer_optimizer=True)
+    ModelService(eager).train_step(old_rows, labels)
+    ModelService(lazy).train_step(old_rows, labels)
+
+    _assert_same_params_and_adam(eager, lazy)
+
+
+def test_lazy_expand_matches_eager(old_rows):
+    """懒加载后首次扩列 + 续训，与原加载方式逐位一致。"""
+    src = os.path.join("checkpoints", "model.pt")
+    labels = [i % 3 for i in range(len(old_rows))]
+
+    eager = expand_bundle(load_checkpoint(src), [NEW_COL])
+    lazy = expand_bundle(load_checkpoint(src, defer_optimizer=True), [NEW_COL])
+    assert lazy.optimizer_loaded  # 扩列触发物化
+    _assert_same_params_and_adam(eager, lazy)
+
+    ModelService(eager).train_step(old_rows, labels)
+    ModelService(lazy).train_step(old_rows, labels)
+    _assert_same_params_and_adam(eager, lazy)
+
+
+def test_lazy_momentum_from_load_time_file_after_atomic_replace(tmp_path, old_rows):
+    """原路径被原子替换后，首次取用的动量仍来自加载时的那份文件。"""
+    src = os.path.join("checkpoints", "model.pt")
+    work = tmp_path / "work.pt"
+    shutil.copy(src, work)
+    lazy = load_checkpoint(str(work), defer_optimizer=True)
+    labels = [i % lazy.num_classes for i in range(len(old_rows))]
+
+    # 另一份检查点 B：多训 3 步（step=203，动量不同）
+    other = load_checkpoint(src)
+    svc_other = ModelService(other)
+    for _ in range(3):
+        svc_other.train_step(old_rows, labels)
+    assert other.optimizer_step == 203
+    b_path = tmp_path / "model_b.pt"
+    save_checkpoint_atomic(other, str(b_path))
+
+    os.replace(b_path, work)  # 原子替换原路径
+
+    # 首次物化：动量来自加载权重时的文件（step=200），不是替换后的 B
+    assert lazy.optimizer_step == 200
+    ModelService(lazy).train_step(old_rows, labels)
+    assert lazy.optimizer_step == 201
+
+    # 与“原方式加载旧文件 + 训一步”逐位一致
+    ref = load_checkpoint(src)
+    ModelService(ref).train_step(old_rows, labels)
+    _assert_same_params_and_adam(ref, lazy)
+
+
+def test_lazy_dtype_conversion_deferred(old_rows):
+    """运行精度与文件精度不同：转换随物化一起推迟，结果与原方式一致。"""
+    src = os.path.join("checkpoints", "model.pt")  # 文件为 float32
+    labels = [i % 3 for i in range(len(old_rows))]
+
+    eager = load_checkpoint(src, dtype=torch.float64)
+    lazy = load_checkpoint(src, dtype=torch.float64, defer_optimizer=True)
+    assert lazy.model.fc1.weight.dtype == torch.float64  # 权重已转运行精度
+    assert not lazy.optimizer_loaded  # 动量尚未读取，也未转换
+
+    ModelService(eager).train_step(old_rows, labels)
+    ModelService(lazy).train_step(old_rows, labels)
+    _assert_same_params_and_adam(eager, lazy)
+    for state in lazy.optimizer.state.values():
+        for value in state.values():
+            if torch.is_tensor(value):
+                assert value.dtype == torch.float64
+
+
+def test_lazy_save_writes_complete_checkpoint(tmp_path):
+    """懒加载后 /save 触发物化，写出的检查点可按原格式完整加载。"""
+    src = os.path.join("checkpoints", "model.pt")
+    lazy = load_checkpoint(src, defer_optimizer=True)
+    assert not lazy.optimizer_loaded
+
+    out = tmp_path / "saved.pt"
+    save_checkpoint_atomic(lazy, str(out))
+    assert lazy.optimizer_loaded  # 保存触发物化
+
+    reloaded = load_checkpoint(str(out))  # 原方式加载
+    assert reloaded.feature_names == OLD_FEATURES
+    assert reloaded.optimizer_step == 200
+    _assert_same_params_and_adam(load_checkpoint(src), reloaded)
+
+
+def test_failed_reload_keeps_old_bundle_usable(tmp_path, old_rows):
+    """重载失败后，原模型仍可预测和续训（动量取自加载时的快照）。"""
+    src = os.path.join("checkpoints", "model.pt")
+    work = tmp_path / "work.pt"
+    shutil.copy(src, work)
+    svc = ModelService(load_checkpoint(str(work), defer_optimizer=True))
+    labels = [i % 3 for i in range(len(old_rows))]
+
+    bad = tmp_path / "corrupt.pt"
+    bad.write_bytes(b"definitely not a checkpoint")
+    with pytest.raises(Exception):
+        svc.reload(str(bad))
+
+    # 原模型仍可预测
+    assert len(svc.predict(old_rows)) == len(old_rows)
+
+    # 即便原路径随后也被破坏，续训仍从加载时钉住的文件快照取动量
+    os.replace(bad, work)
+    out = svc.train_step(old_rows, labels)
+    assert out["step"] == 201
+
+    # 与“原方式加载 + 训一步”逐位一致
+    ref = load_checkpoint(src)
+    ModelService(ref).train_step(old_rows, labels)
+    _assert_same_params_and_adam(ref, svc.bundle)

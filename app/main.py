@@ -1,6 +1,7 @@
 """单作业分类模型 API（FastAPI + CPU PyTorch）。
 
-启动时从 CHECKPOINT_PATH 加载含 Adam 状态的检查点。
+启动时从 CHECKPOINT_PATH 加载检查点（延迟物化：只读权重、列名与
+Adam 步数；动量张量首次训练/扩列/保存时才读入并转换精度）。
 环境变量：
     CHECKPOINT_PATH   检查点文件（默认 checkpoints/model.pt）
     MODEL_DTYPE       float32（默认）或 float64
@@ -51,7 +52,7 @@ service: ModelService | None = None
 async def lifespan(app: "FastAPI"):
     global service
     try:
-        bundle = load_checkpoint(CHECKPOINT_PATH, dtype=_DTYPE)
+        bundle = load_checkpoint(CHECKPOINT_PATH, dtype=_DTYPE, defer_optimizer=True)
     except Exception as exc:  # 启动期失败直接暴露，避免空服务
         raise RuntimeError(f"加载检查点失败 {CHECKPOINT_PATH}: {exc}") from exc
     service = ModelService(bundle)
@@ -130,5 +131,7 @@ async def reload(path: str | None = None) -> dict:
     async with svc.lock:
         try:
             return svc.reload(path)
-        except (FileNotFoundError, OSError, RuntimeError, KeyError, ValueError) as exc:
+        except Exception as exc:
+            # 重载失败（文件缺失/损坏/格式不符等）不拖垮服务：
+            # 原模型仍可预测和续训
             raise HTTPException(status_code=500, detail=f"重载失败: {exc}") from exc
