@@ -1,0 +1,23 @@
+services:
+  classifier-api:
+    build: .
+    image: vibration-classifier-api:latest
+    container_name: vibration-classifier-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 检查点路径（容器内）；挂载卷后保存的新版本在宿主机同目录可见
+      CHECKPOINT_PATH: /app/checkpoints/model.pt
+      # float32 已满足 1e-6 对照要求；如需更高精度可改为 float64
+      MODEL_DTYPE: float32
+      TORCH_NUM_THREADS: "1"
+    volumes:
+      # 旧检查点只读进入，新版本写到单独的可写目录
+      - ./checkpoints:/app/checkpoints
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
